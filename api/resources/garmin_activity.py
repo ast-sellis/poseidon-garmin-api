@@ -1,14 +1,13 @@
-from flask import Blueprint, request, jsonify
-from flask_restful import Api, Resource
+from flask import Blueprint, request, jsonify, Response
+from flask_restful import Api, Resource, reqparse
 import os
-from influxdb_client_3 import InfluxDBClient3, flight_client_options
+from influxdb_client import InfluxDBClient, Point, WritePrecision
 from dotenv import load_dotenv
-import certifi
 import logging
 from geojson import Feature, FeatureCollection, LineString
 from datetime import datetime, timedelta
-from flask_restful import reqparse
 import time
+import json
 
 load_dotenv()
 
@@ -19,22 +18,18 @@ logger = logging.getLogger(__name__)
 # InfluxDB setup
 token = os.getenv("INFLUXDB_TOKEN")
 org = "Technical Team"
-host = "https://us-east-1-1.aws.cloud2.influxdata.com"
+url = "https://us-east-1-1.aws.cloud2.influxdata.com"
 
-with open(certifi.where(), "r") as fh:
-    cert = fh.read()
-
-fco = flight_client_options(
-    tls_root_certs=cert,
-)
-
-influx_client = InfluxDBClient3(
-    host=host,
+# Initialize InfluxDB client
+influx_client = InfluxDBClient(
+    url=url,
     token=token,
     org=org,
-    database="garmin",
-    flight_client_options=fco,
 )
+
+# Create APIs
+write_api = influx_client.write_api()
+query_api = influx_client.query_api()
 
 # Create a blueprint for Garmin-related endpoints
 garmin_bp = Blueprint("garmin", __name__, url_prefix="/garmin")
@@ -53,10 +48,10 @@ def filter_tags(tags):
 
 MAX_BATCH_SIZE = 500
 
-def write_in_batches(client, database, records, precision):
+def write_in_batches(client, bucket, records, precision):
     for i in range(0, len(records), MAX_BATCH_SIZE):
         batch = records[i:i + MAX_BATCH_SIZE]
-        client.write(database=database, record=batch, write_precision=precision)
+        client.write(bucket=bucket, org=org, record=batch, write_precision=precision)
 
 class GarminActivity(Resource):
     def post(self):
@@ -65,30 +60,31 @@ class GarminActivity(Resource):
             if not activities:
                 return {"errorMessage": "No activities provided", "status": "error"}, 400
 
+            points = []
+
             for activity in activities:
                 activity_type = activity.get("activityType")
                 if not is_activity_allowed(activity_type):
                     continue
 
-                summary_point = {
-                    "measurement": "garmin_activity",
-                    "tags": {
-                        "userId": activity.get("userId"),
-                        "activityType": activity_type,
-                        "activityId": activity.get("activityId"),
-                        "deviceName": activity.get("deviceName"),
-                    },
-                    "fields": filter_fields(activity, ["userId", "activityType", "activityId", "deviceName"]),
-                    "time": activity.get("startTimeInSeconds"),
-                }
-                logger.info(f"Writing summary point: {summary_point}")
-                influx_client.write(database="garmin", record=summary_point, write_precision="s")
+                point = Point("garmin_activity") \
+                    .tag("userId", activity.get("userId")) \
+                    .tag("activityType", activity_type) \
+                    .tag("activityId", activity.get("activityId")) \
+                    .tag("deviceName", activity.get("deviceName")) \
+                    .time(activity.get("startTimeInSeconds"), WritePrecision.S) \
+                    .field("data", json.dumps(filter_fields(activity, ["userId", "activityType", "activityId", "deviceName"])))
+
+                points.append(point)
+
+            if points:
+                logger.info(f"Writing {len(points)} activity summary points")
+                write_api.write(bucket="garmin", org=org, record=points, write_precision=WritePrecision.S)
 
             return {"message": "Activity summaries processed successfully", "status": "success"}, 200
         except Exception as e:
             logger.error(f"Error processing Garmin activities: {e}")
             return {"errorMessage": str(e), "status": "error"}, 500
-
 
 class GarminActivityDetails(Resource):
     def post(self):
@@ -109,42 +105,39 @@ class GarminActivityDetails(Resource):
                     continue
 
                 # Prepare the summary point
-                summary_point = {
-                    "measurement": "garmin_activity_details",
-                    "tags": filter_tags({
-                        "userId": detail.get("userId"),
-                        "activityType": activity_type,
-                        "activityId": summary.get("activityId"),
-                        "deviceName": summary.get("deviceName"),
-                    }),
-                    "fields": filter_fields(summary, ["userId", "activityType", "activityId", "deviceName"]),
-                    "time": summary.get("startTimeInSeconds"),
-                }
+                summary_point = Point("garmin_activity_details") \
+                    .tag("userId", detail.get("userId")) \
+                    .tag("activityType", activity_type) \
+                    .tag("activityId", summary.get("activityId")) \
+                    .tag("deviceName", summary.get("deviceName")) \
+                    .time(summary.get("startTimeInSeconds"), WritePrecision.S) \
+                    .field("data", json.dumps(filter_fields(summary, ["userId", "activityType", "activityId", "deviceName"])))
+
                 summary_points.append(summary_point)
 
                 # Prepare the sample points
                 for sample in samples:
-                    sample_point = {
-                        "measurement": "garmin_activity_samples",
-                        "tags": filter_tags({
-                            "userId": detail.get("userId"),
-                            "activityType": activity_type,
-                            "activityId": summary.get("activityId"),
-                        }),
-                        "fields": filter_fields(sample, ["userId", "activityType", "activityId"]),
-                        "time": sample.get("startTimeInSeconds"),
-                    }
+                    sample_point = Point("garmin_activity_samples") \
+                        .tag("userId", detail.get("userId")) \
+                        .tag("activityType", activity_type) \
+                        .tag("activityId", summary.get("activityId")) \
+                        .time(sample.get("startTimeInSeconds"), WritePrecision.S)
+
+                    # Add fields dynamically
+                    for k, v in filter_fields(sample, ["userId", "activityType", "activityId"]).items():
+                        sample_point.field(k, v)
+
                     sample_points.append(sample_point)
 
-            # Write the summary points in a single batch
+            # Write the summary points
             if summary_points:
                 logger.info(f"Writing {len(summary_points)} summary points")
-                write_in_batches(influx_client, "garmin", summary_points, "s")
+                write_in_batches(write_api, "garmin", summary_points, WritePrecision.S)
 
-            # Write the sample points in a single batch
+            # Write the sample points
             if sample_points:
                 logger.info(f"Writing {len(sample_points)} sample points")
-                write_in_batches(influx_client, "garmin", sample_points, "s")
+                write_in_batches(write_api, "garmin", sample_points, WritePrecision.S)
 
             return {"message": "Activity details processed successfully", "status": "success"}, 200
         except Exception as e:
@@ -152,7 +145,6 @@ class GarminActivityDetails(Resource):
             if "503" in str(e):
                 return {"errorMessage": "Service temporarily unavailable. Please try again later.", "status": "error"}, 503
             return {"errorMessage": str(e), "status": "error"}, 500
-
 
 class GarminActivityGeoJSON(Resource):
     def get(self):
@@ -179,39 +171,39 @@ class GarminActivityGeoJSON(Resource):
             start_of_day = datetime(date.year, date.month, date.day)
             end_of_day = start_of_day + timedelta(days=1)
 
-            # Query the database
-            query = f"""
-                SELECT 
-                    "latitudeInDegree", "longitudeInDegree", "time", "activityId"
-                FROM "garmin_activity_samples"
-                WHERE
-                    time >= TIMESTAMP '{start_of_day.isoformat()}Z'
-                    AND time <= TIMESTAMP '{end_of_day.isoformat()}Z'
-                    AND "userId" IN ('{user_id}')
-                """
-            logger.info(f"Executing query:\n{query}")
-            start_time = time.time()  # Start timer
-            result = influx_client.query(query)
-            end_time = time.time()  # End timer
+            # Build Flux query
+            query = f'''
+from(bucket: "garmin")
+  |> range(start: {start_of_day.isoformat()}Z, stop: {end_of_day.isoformat()}Z)
+  |> filter(fn: (r) => r["_measurement"] == "garmin_activity_samples")
+  |> filter(fn: (r) => r["userId"] == "{user_id}")
+  |> filter(fn: (r) => r["_field"] == "latitudeInDegree" or r["_field"] == "longitudeInDegree" or r["_field"] == "activityId")
+  |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+'''
 
+            logger.info(f"Executing query:\n{query}")
+            start_time = time.time()
+            result = query_api.query(query)
+            end_time = time.time()
             logger.info(f"Query execution time: {end_time - start_time:.3f}s")
 
-            # Convert query result to a Python list
-            records = result.to_pylist()
+            # Process the results into GeoJSON format
+            records = []
+            for table in result:
+                for record in table.records:
+                    records.append(record.values)
+
             logger.info(f"Query returned {len(records)} records")
 
             # Process the results into GeoJSON format
             activities = {}
             for record in records:
-                # logging.info(f"Record: {record}")
-                # Extract relevant fields dynamically
                 activity_id = record.get("activityId")
                 latitude = record.get("latitudeInDegree")
                 longitude = record.get("longitudeInDegree")
-                time_field = record.get("time")
 
                 # Skip invalid records
-                if not all([activity_id, latitude, longitude, time_field]):
+                if not all([activity_id, latitude, longitude]):
                     continue
 
                 # Convert to floats for GeoJSON
@@ -235,7 +227,7 @@ class GarminActivityGeoJSON(Resource):
                 features.append(
                     Feature(
                         geometry=LineString(coordinates),
-                        properties={"activityID": activity_id},
+                        properties={"activityId": activity_id},
                     )
                 )
 
