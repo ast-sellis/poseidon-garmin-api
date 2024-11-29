@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify, Response
+from flask import Blueprint, request
 from flask_restful import Api, Resource, reqparse
 import os
 from influxdb_client import InfluxDBClient, Point, WritePrecision
@@ -177,7 +177,7 @@ from(bucket: "garmin")
   |> range(start: {start_of_day.isoformat()}Z, stop: {end_of_day.isoformat()}Z)
   |> filter(fn: (r) => r["_measurement"] == "garmin_activity_samples")
   |> filter(fn: (r) => r["userId"] == "{user_id}")
-  |> filter(fn: (r) => r["_field"] == "latitudeInDegree" or r["_field"] == "longitudeInDegree" or r["_field"] == "activityId")
+  |> filter(fn: (r) => r["_field"] == "latitudeInDegree" or r["_field"] == "longitudeInDegree" or r["_field"] == "activityId" or r["_field"] == "activityType")
   |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
 '''
 
@@ -201,9 +201,10 @@ from(bucket: "garmin")
                 activity_id = record.get("activityId")
                 latitude = record.get("latitudeInDegree")
                 longitude = record.get("longitudeInDegree")
+                activity_type = record.get("activityType")
 
                 # Skip invalid records
-                if not all([activity_id, latitude, longitude]):
+                if not all([activity_id, latitude, longitude, activity_type]):
                     continue
 
                 # Convert to floats for GeoJSON
@@ -227,7 +228,7 @@ from(bucket: "garmin")
                 features.append(
                     Feature(
                         geometry=LineString(coordinates),
-                        properties={"activityId": activity_id},
+                        properties={"activityId": activity_id, "activityType": activity_type},
                     )
                 )
 
