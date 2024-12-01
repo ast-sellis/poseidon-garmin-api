@@ -34,7 +34,9 @@ def create_app(test_config=None):
         pass
 
     from .resources.garmin_activity import garmin_bp
+    from .resources.garmin_geojson import garmin_geojson_bp
 
     app.register_blueprint(garmin_bp)
-
+    app.register_blueprint(garmin_geojson_bp)
+    
     return app
