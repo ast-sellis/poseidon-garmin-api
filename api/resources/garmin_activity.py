@@ -5,7 +5,7 @@ from influxdb_client_3 import InfluxDBClient3, flight_client_options
 from dotenv import load_dotenv
 import certifi
 import logging
-
+import json
 
 load_dotenv()
 
@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 # InfluxDB setup
 token = os.getenv("INFLUXDB_TOKEN")
+logger.info(f"Token: {token}")
 org = "Technical Team"
 host = "https://us-east-1-1.aws.cloud2.influxdata.com"
 
@@ -29,7 +30,6 @@ influx_client = InfluxDBClient3(
     host=host,
     token=token,
     org=org,
-    database="garmin",
     flight_client_options=fco,
 )
 
@@ -79,7 +79,7 @@ class GarminActivity(Resource):
                     "time": activity.get("startTimeInSeconds"),
                 }
                 logger.info(f"Writing summary point: {summary_point}")
-                influx_client.write(database="garmin", record=summary_point, write_precision="s")
+                influx_client.write(database="garmin_activities", record=summary_point, write_precision="s")
 
             return {"message": "Activity summaries processed successfully", "status": "success"}, 200
         except Exception as e:
@@ -94,8 +94,30 @@ class GarminActivityDetails(Resource):
             if not details:
                 return {"errorMessage": "No activity details provided", "status": "error"}, 400
 
+            # Write details to debug_output.json
+            debug_output_path = "debug_output.json"
+            with open(debug_output_path, "w") as debug_file:
+                json.dump(details, debug_file, indent=4)
+            
+            
+
             summary_points = []
             sample_points = []
+
+            def calculate_cog(lat1, lon1, lat2, lon2):
+                """Calculate Course Over Ground (COG) in degrees between two points."""
+                import math
+
+                delta_lon = math.radians(lon2 - lon1)
+                lat1 = math.radians(lat1)
+                lat2 = math.radians(lat2)
+
+                x = math.sin(delta_lon) * math.cos(lat2)
+                y = math.cos(lat1) * math.sin(lat2) - (math.sin(lat1) * math.cos(lat2) * math.cos(delta_lon))
+                initial_bearing = math.atan2(x, y)
+
+                # Convert radians to degrees and normalize to 0-360
+                return (math.degrees(initial_bearing) + 360) % 360
 
             for detail in details:
                 summary = detail.get("summary", {})
@@ -120,28 +142,47 @@ class GarminActivityDetails(Resource):
                 summary_points.append(summary_point)
 
                 # Prepare the sample points
+                previous_sample = None
                 for sample in samples:
+                    latitude = sample.get("latitudeInDegree")
+                    longitude = sample.get("longitudeInDegree")
+
+                    # Calculate COG if the previous sample exists
+                    if previous_sample and latitude is not None and longitude is not None:
+                        prev_lat = previous_sample.get("latitudeInDegree")
+                        prev_lon = previous_sample.get("longitudeInDegree")
+                        if prev_lat is not None and prev_lon is not None:
+                            cog = calculate_cog(prev_lat, prev_lon, latitude, longitude)
+                        else:
+                            cog = None
+                    else:
+                        cog = None  # First sample or missing coordinates
+
                     sample_point = {
-                        "measurement": "garmin_activity_samples",
+                        "measurement": "garmin_samples",
                         "tags": filter_tags({
                             "userId": detail.get("userId"),
                             "activityType": activity_type,
                             "activityId": summary.get("activityId"),
                         }),
-                        "fields": filter_fields(sample, ["userId", "activityType", "activityId"]),
+                        "fields": {
+                            **filter_fields(sample, ["userId", "activityType", "activityId"]),
+                            "courseOverGround": cog,
+                        },
                         "time": sample.get("startTimeInSeconds"),
                     }
                     sample_points.append(sample_point)
+                    previous_sample = sample  # Update the previous sample
 
             # Write the summary points in a single batch
             if summary_points:
                 logger.info(f"Writing {len(summary_points)} summary points")
-                write_in_batches(influx_client, "garmin", summary_points, "s")
+                write_in_batches(influx_client, "garmin_activities", summary_points, "s")
 
             # Write the sample points in a single batch
             if sample_points:
                 logger.info(f"Writing {len(sample_points)} sample points")
-                write_in_batches(influx_client, "garmin", sample_points, "s")
+                write_in_batches(influx_client, "garmin_activities", sample_points, "s")
 
             return {"message": "Activity details processed successfully", "status": "success"}, 200
         except Exception as e:
@@ -149,7 +190,6 @@ class GarminActivityDetails(Resource):
             if "503" in str(e):
                 return {"errorMessage": "Service temporarily unavailable. Please try again later.", "status": "error"}, 503
             return {"errorMessage": str(e), "status": "error"}, 500
-
 
 # Add resources to the API
 api.add_resource(GarminActivity, "/activity")
